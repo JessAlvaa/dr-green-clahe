@@ -11,12 +11,6 @@ import tensorflow as tf
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "final_fixed_green_clahe_80_10_10_runtime_results" / "models" / "best_phase2.keras"
-TEST_METRICS_PATH = (
-        BASE_DIR
-        / "final_fixed_green_clahe_80_10_10_runtime_results"
-        / "evaluation"
-        / "reports"
-)
 
 IMG_SIZE = 300
 BATCH_SIZE = 1
