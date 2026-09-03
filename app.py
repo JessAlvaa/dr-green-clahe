@@ -16,7 +16,6 @@ TEST_METRICS_PATH = (
         / "final_fixed_green_clahe_80_10_10_runtime_results"
         / "evaluation"
         / "reports"
-        / "test_metrics.json"
 )
 
 IMG_SIZE = 300
