@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.env
+.cache/
+.keras/
+.ipynb_checkpoints/
+.idea/
