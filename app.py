@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import cv2
@@ -39,23 +38,11 @@ GRADE_DESCRIPTIONS = {
 DEFAULT_GRADCAM_TARGET_LAYER = "top_activation"
 
 
-def load_json(path: Path) -> dict:
-    if not path.exists():
-        raise FileNotFoundError(f"Required artifact not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 @st.cache_resource(show_spinner="Preparing analysis model...")
 def load_model() -> tf.keras.Model:
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"Model checkpoint not found: {MODEL_PATH}")
     return tf.keras.models.load_model(str(MODEL_PATH), compile=False)
-
-
-@st.cache_data
-def load_test_metrics() -> dict:
-    return load_json(TEST_METRICS_PATH)
 
 
 def apply_fixed_green_channel_clahe(img_rgb: np.ndarray) -> np.ndarray:
@@ -430,7 +417,6 @@ def main() -> None:
 
     try:
         model = load_model()
-        test_metrics = load_test_metrics()
     except Exception as exc:
         st.error(f"Could not initialize app: {exc}")
         st.stop()
