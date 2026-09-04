@@ -1,4 +1,4 @@
-﻿
+
 
 # %%
 import os
@@ -897,250 +897,6 @@ def compute_grade_metrics(
     return metrics
 
 
-def apply_mild_threshold_rule(
-    y_pred: np.ndarray,
-    y_prob: np.ndarray,
-    mild_min_prob: float,
-    mild_no_dr_ratio: float,
-    mild_margin_vs_current: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    calibrated_pred = y_pred.copy()
-    p_no_dr = y_prob[:, 0]
-    p_mild = y_prob[:, 1]
-    p_current = y_prob[np.arange(len(y_prob)), y_pred]
-
-    # Conservative post-hoc rule: keep 5-class classification, and only promote
-    # borderline No DR / Moderate predictions into Mild when validation tuning
-    # shows the Mild probability is sufficiently competitive.
-    flip_to_mild = (
-        np.isin(y_pred, [0, 2])
-        & (p_mild >= mild_min_prob)
-        & ((p_mild / np.maximum(p_no_dr, 1e-12)) >= mild_no_dr_ratio)
-        & (p_mild >= (p_current - mild_margin_vs_current))
-    )
-    calibrated_pred[flip_to_mild] = 1
-    return calibrated_pred, flip_to_mild
-
-
-def select_mild_threshold_on_validation(val_results: dict) -> tuple[dict, pd.DataFrame]:
-    y_true = val_results["y_true"]
-    y_pred = val_results["y_pred"]
-    y_prob = val_results["y_prob"]
-    base = val_results["metrics"]
-
-    rows = []
-    mild_min_probs = np.round(np.arange(0.02, 0.401, 0.01), 4)
-    mild_no_dr_ratios = np.round(np.arange(0.05, 1.001, 0.025), 4)
-    mild_margins = np.round(np.arange(0.00, 0.201, 0.025), 4)
-
-    for mild_min_prob in mild_min_probs:
-        for mild_no_dr_ratio in mild_no_dr_ratios:
-            for mild_margin_vs_current in mild_margins:
-                calibrated_pred, flipped = apply_mild_threshold_rule(
-                    y_pred,
-                    y_prob,
-                    float(mild_min_prob),
-                    float(mild_no_dr_ratio),
-                    float(mild_margin_vs_current),
-                )
-                metrics = compute_grade_metrics(
-                    "val",
-                    val_df,
-                    y_true,
-                    calibrated_pred,
-                    y_prob,
-                )
-                rows.append(
-                    {
-                        "mild_min_prob": float(mild_min_prob),
-                        "mild_no_dr_ratio": float(mild_no_dr_ratio),
-                        "mild_margin_vs_current": float(mild_margin_vs_current),
-                        "n_flipped_to_mild": int(flipped.sum()),
-                        **metrics,
-                    }
-                )
-
-    search_df = pd.DataFrame(rows)
-
-    strict_pool = search_df[
-        (search_df["mild_recall"] > base["mild_recall"])
-        & (search_df["mild_f1"] > base["mild_f1"])
-        & (search_df["macro_f1"] >= base["macro_f1"] - 0.005)
-        & (search_df["qwk"] >= base["qwk"] - 0.010)
-        & (search_df["referable_sensitivity"] >= base["referable_sensitivity"] - 0.010)
-        & (search_df["referable_specificity"] >= base["referable_specificity"] - 0.010)
-    ].copy()
-
-    if len(strict_pool) > 0:
-        selection_pool = strict_pool
-        selection_mode = "strict_validation_guardrails"
-    else:
-        relaxed_pool = search_df[
-            (search_df["mild_recall"] > base["mild_recall"])
-            & (search_df["mild_f1"] > base["mild_f1"])
-            & (search_df["macro_f1"] >= base["macro_f1"] - 0.015)
-            & (search_df["qwk"] >= base["qwk"] - 0.020)
-            & (search_df["referable_sensitivity"] >= base["referable_sensitivity"] - 0.020)
-            & (search_df["referable_specificity"] >= base["referable_specificity"] - 0.020)
-        ].copy()
-        selection_pool = relaxed_pool if len(relaxed_pool) > 0 else search_df.copy()
-        selection_mode = (
-            "relaxed_validation_guardrails"
-            if len(relaxed_pool) > 0
-            else "fallback_best_composite"
-        )
-
-    selection_pool["selection_score"] = (
-        3.0 * (selection_pool["mild_f1"] - base["mild_f1"])
-        + 2.0 * (selection_pool["mild_recall"] - base["mild_recall"])
-        + 1.0 * (selection_pool["macro_f1"] - base["macro_f1"])
-        + 1.5 * (selection_pool["qwk"] - base["qwk"])
-        + 0.75 * (selection_pool["referable_sensitivity"] - base["referable_sensitivity"])
-        + 0.75 * (selection_pool["referable_specificity"] - base["referable_specificity"])
-    )
-
-    best = selection_pool.sort_values(
-        ["selection_score", "mild_f1", "mild_recall", "macro_f1", "qwk"],
-        ascending=False,
-    ).iloc[0]
-
-    selected_threshold = {
-        "selection_mode": selection_mode,
-        "mild_min_prob": float(best["mild_min_prob"]),
-        "mild_no_dr_ratio": float(best["mild_no_dr_ratio"]),
-        "mild_margin_vs_current": float(best["mild_margin_vs_current"]),
-    }
-    return selected_threshold, search_df
-
-
-def make_calibrated_prediction_frame(
-    split_df: pd.DataFrame,
-    y_true: np.ndarray,
-    y_pred_original: np.ndarray,
-    y_pred_calibrated: np.ndarray,
-    y_prob: np.ndarray,
-    flipped_to_mild: np.ndarray,
-) -> pd.DataFrame:
-    pred_df = make_prediction_frame(split_df, y_true, y_pred_original, y_prob)
-    pred_df["pred_label_original"] = y_pred_original
-    pred_df["pred_class_original"] = [CLASS_NAMES[label] for label in y_pred_original]
-    pred_df["pred_label_calibrated"] = y_pred_calibrated
-    pred_df["pred_class_calibrated"] = [CLASS_NAMES[label] for label in y_pred_calibrated]
-    pred_df["correct_calibrated"] = pred_df["true_label"] == pred_df["pred_label_calibrated"]
-    pred_df["flipped_to_mild"] = flipped_to_mild
-    return pred_df
-
-
-def save_calibrated_artifacts(
-    split_name: str,
-    split_df: pd.DataFrame,
-    results: dict,
-    selected_threshold: dict,
-) -> dict:
-    threshold_kwargs = {
-        "mild_min_prob": selected_threshold["mild_min_prob"],
-        "mild_no_dr_ratio": selected_threshold["mild_no_dr_ratio"],
-        "mild_margin_vs_current": selected_threshold["mild_margin_vs_current"],
-    }
-    y_pred_calibrated, flipped = apply_mild_threshold_rule(
-        results["y_pred"], results["y_prob"], **threshold_kwargs
-    )
-    metrics = compute_grade_metrics(
-        split_name,
-        split_df,
-        results["y_true"],
-        y_pred_calibrated,
-        results["y_prob"],
-    )
-    metrics["version"] = "mild_threshold_calibrated"
-    metrics["n_flipped_to_mild"] = int(flipped.sum())
-
-    pred_df = make_calibrated_prediction_frame(
-        split_df,
-        results["y_true"],
-        results["y_pred"],
-        y_pred_calibrated,
-        results["y_prob"],
-        flipped,
-    )
-    pred_df.to_csv(
-        PREDICTION_DIR / f"{split_name}_predictions_mild_threshold_calibrated.csv",
-        index=False,
-    )
-
-    report_text = classification_report(
-        results["y_true"],
-        y_pred_calibrated,
-        labels=list(range(CFG.num_classes)),
-        target_names=CLASS_NAMES,
-        digits=4,
-        zero_division=0,
-    )
-    report_dict = classification_report(
-        results["y_true"],
-        y_pred_calibrated,
-        labels=list(range(CFG.num_classes)),
-        target_names=CLASS_NAMES,
-        digits=4,
-        zero_division=0,
-        output_dict=True,
-    )
-    cm = confusion_matrix(
-        results["y_true"], y_pred_calibrated, labels=list(range(CFG.num_classes))
-    )
-    pd.DataFrame(cm, index=CLASS_NAMES, columns=CLASS_NAMES).to_csv(
-        REPORT_DIR / f"{split_name}_confusion_matrix_mild_threshold_calibrated.csv"
-    )
-    pd.DataFrame(report_dict).transpose().to_csv(
-        REPORT_DIR / f"{split_name}_classification_report_mild_threshold_calibrated.csv"
-    )
-    with open(
-        REPORT_DIR / f"{split_name}_classification_report_mild_threshold_calibrated.txt",
-        "w",
-    ) as f:
-        f.write(report_text)
-    save_json(metrics, REPORT_DIR / f"{split_name}_metrics_mild_threshold_calibrated.json")
-
-    return {
-        "split": split_name,
-        "y_pred": y_pred_calibrated,
-        "flipped_to_mild": flipped,
-        "metrics": metrics,
-        "report_text": report_text,
-    }
-
-
-def plot_validation_threshold_search(search_df: pd.DataFrame, base_metrics: dict) -> None:
-    for metric in ["mild_f1", "mild_recall", "macro_f1", "qwk"]:
-        best_by_prob = (
-            search_df.sort_values(metric, ascending=False)
-            .groupby("mild_min_prob", as_index=False)
-            .first()
-            .sort_values("mild_min_prob")
-        )
-        plt.figure(figsize=(8, 5))
-        plt.plot(
-            best_by_prob["mild_min_prob"],
-            best_by_prob[metric],
-            marker="o",
-            linewidth=1.5,
-        )
-        plt.axhline(
-            base_metrics[metric],
-            color="gray",
-            linestyle="--",
-            label="Original validation",
-        )
-        plt.xlabel("Mild minimum probability")
-        plt.ylabel(metric)
-        plt.title(f"Validation Mild threshold search: {metric}")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(PLOT_DIR / f"mild_threshold_validation_{metric}.png", dpi=150)
-        plt.show()
-        plt.close()
-
-
 history = {"phase1": hist1, "phase2": hist2}
 history_df = build_history_frame(history)
 history_df.to_csv(OUTPUT_DIR / "history.csv", index=False)
@@ -1149,91 +905,24 @@ save_json({phase: hist.history for phase, hist in history.items()}, OUTPUT_DIR /
 val_results = evaluate_split(best_model, val_ds, val_df, "val")
 test_results = evaluate_split(best_model, test_ds, test_df, "test")
 
-selected_mild_threshold, mild_threshold_search_df = select_mild_threshold_on_validation(val_results)
-mild_threshold_search_df.to_csv(
-    REPORT_DIR / "validation_mild_threshold_search_results.csv", index=False
-)
-pd.DataFrame([selected_mild_threshold]).to_csv(
-    REPORT_DIR / "selected_mild_threshold.csv", index=False
-)
-save_json(selected_mild_threshold, REPORT_DIR / "selected_mild_threshold.json")
-plot_validation_threshold_search(mild_threshold_search_df, val_results["metrics"])
-
-calibrated_val_results = save_calibrated_artifacts(
-    "val", val_df, val_results, selected_mild_threshold
-)
-calibrated_test_results = save_calibrated_artifacts(
-    "test", test_df, test_results, selected_mild_threshold
-)
-
 summary_df = pd.DataFrame([val_results["metrics"], test_results["metrics"]])
 summary_df.to_csv(EVAL_DIR / "metrics_summary.csv", index=False)
-calibrated_summary_df = pd.DataFrame(
-    [
-        {"version": "original_single_task", **val_results["metrics"]},
-        {"version": "original_single_task", **test_results["metrics"]},
-        calibrated_val_results["metrics"],
-        calibrated_test_results["metrics"],
-    ]
-)
-calibrated_summary_df.to_csv(
-    EVAL_DIR / "metrics_summary_with_mild_threshold_calibration.csv", index=False
-)
 
-thesis_metrics = [
-    "accuracy",
-    "macro_f1",
-    "qwk",
-    "mild_recall",
-    "mild_f1",
-    "referable_sensitivity",
-    "referable_specificity",
-    "referable_auc",
-]
-thesis_comparison_df = calibrated_summary_df[
-    ["split", "version", *thesis_metrics]
-].copy()
-thesis_comparison_df.to_csv(
-    REPORT_DIR / "original_vs_mild_threshold_calibrated_metrics.csv", index=False
-)
-
-original_test_row = thesis_comparison_df[
-    thesis_comparison_df["split"].eq("test")
-    & thesis_comparison_df["version"].eq("original_single_task")
-].iloc[0]
-calibrated_test_row = thesis_comparison_df[
-    thesis_comparison_df["split"].eq("test")
-    & thesis_comparison_df["version"].eq("mild_threshold_calibrated")
-].iloc[0]
-test_delta_df = pd.DataFrame(
-    [
-        {
-            "metric": metric,
-            "original_test": original_test_row[metric],
-            "calibrated_test": calibrated_test_row[metric],
-            "delta": calibrated_test_row[metric] - original_test_row[metric],
-        }
-        for metric in thesis_metrics
-    ]
-)
-test_delta_df.to_csv(REPORT_DIR / "test_metric_deltas_after_mild_calibration.csv", index=False)
 save_json(
     {
+        "description": "5-Class DR Classification - No Mild Threshold Calibration",
         "config": asdict(CFG),
         "best_model_path": str(BEST_MODEL_PATH),
-        "selected_mild_threshold": selected_mild_threshold,
         "metrics": {
             "val": val_results["metrics"],
             "test": test_results["metrics"],
-            "val_mild_threshold_calibrated": calibrated_val_results["metrics"],
-            "test_mild_threshold_calibrated": calibrated_test_results["metrics"],
         },
     },
     EVAL_DIR / "evaluation_summary.json",
 )
 
 with open(OUTPUT_DIR / "results_corrected_pipeline.txt", "w") as f:
-    f.write("=== Final Single-Task 5-Class DR Pipeline with Post-hoc Mild Threshold Calibration ===\n")
+    f.write("=== 5-Class DR Classification - No Mild Threshold Calibration ===\n")
     f.write(f"Best model checkpoint: {BEST_MODEL_PATH}\n\n")
     f.write("Configuration:\n")
     f.write(json.dumps(asdict(CFG), indent=2))
@@ -1242,15 +931,6 @@ with open(OUTPUT_DIR / "results_corrected_pipeline.txt", "w") as f:
         f.write(json.dumps(results["metrics"], indent=2, default=to_serializable))
         f.write(f"\n\n=== {results['split'].upper()} CLASSIFICATION REPORT ===\n")
         f.write(results["report_text"])
-    f.write("\n\n=== SELECTED MILD THRESHOLD FROM VALIDATION ONLY ===\n")
-    f.write(json.dumps(selected_mild_threshold, indent=2, default=to_serializable))
-    for results in [calibrated_val_results, calibrated_test_results]:
-        f.write(f"\n\n=== {results['split'].upper()} MILD-THRESHOLD CALIBRATED METRICS ===\n")
-        f.write(json.dumps(results["metrics"], indent=2, default=to_serializable))
-        f.write(f"\n\n=== {results['split'].upper()} MILD-THRESHOLD CALIBRATED CLASSIFICATION REPORT ===\n")
-        f.write(results["report_text"])
-    f.write("\n\n=== TEST METRIC DELTAS AFTER MILD CALIBRATION ===\n")
-    f.write(test_delta_df.to_string(index=False))
 
 plot_training_curves(history_df, PLOT_DIR / "training_curves.png")
 for results in [val_results, test_results]:
@@ -1270,27 +950,5 @@ for results in [val_results, test_results]:
         normalize=True,
     )
 
-for original_results, calibrated_results in [
-    (val_results, calibrated_val_results),
-    (test_results, calibrated_test_results),
-]:
-    split_name = original_results["split"]
-    plot_confusion_matrix(
-        original_results["y_true"],
-        calibrated_results["y_pred"],
-        f"{split_name.upper()} Mild-threshold calibrated confusion matrix",
-        PLOT_DIR / f"cm_{split_name}_mild_threshold_calibrated.png",
-        normalize=False,
-    )
-    plot_confusion_matrix(
-        original_results["y_true"],
-        calibrated_results["y_pred"],
-        f"{split_name.upper()} Mild-threshold calibrated normalized confusion matrix",
-        PLOT_DIR / f"cm_{split_name}_mild_threshold_calibrated_normalized.png",
-        normalize=True,
-    )
-
-print(f"Saved organized evaluation artifacts under: {EVAL_DIR}")
+print(f"Saved original-only evaluation artifacts under: {EVAL_DIR}")
 print(f"Saved plots under: {PLOT_DIR}")
-print("Selected Mild threshold from validation only:")
-print(json.dumps(selected_mild_threshold, indent=2, default=to_serializable))
