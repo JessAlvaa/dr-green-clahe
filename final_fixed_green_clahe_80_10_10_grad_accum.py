@@ -54,8 +54,8 @@ class ExperimentConfig:
     num_classes: int = 5
     label_col: str = "level"
 
-    # Validity first: default corrected split. Use "legacy_image" only to reproduce old baseline.
-    split_strategy: str = "patient_grouped"  # "patient_grouped" or "legacy_image"
+    # Validity first: corrected split.
+    split_strategy: str = "patient_grouped"  # "patient_grouped" 
     train_size: float = 0.80
     val_size: float = 0.10
     test_size: float = 0.10
